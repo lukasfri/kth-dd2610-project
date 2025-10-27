@@ -5,7 +5,7 @@ description = "Default template for PDM package"
 authors = [
     {name = "Lukas Friman", email = "lukasfri@kth.se"},
 ]
-dependencies = []
+dependencies = ["ipykernel>=7.1.0", "jax>=0.8.0", "flax[all]>=0.12.0", "datasets>=4.3.0", "Pillow>=12.0.0"]
 requires-python = "==3.13.*"
 readme = "README.md"
 license = {text = "MIT"}
