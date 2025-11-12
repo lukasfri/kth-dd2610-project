@@ -2,14 +2,16 @@
 name = "kth-dd2610-project"
 version = "0.1.0"
 description = "Default template for PDM package"
-authors = [
-    {name = "Lukas Friman", email = "lukasfri@kth.se"},
+authors = [{ name = "Lukas Friman", email = "lukasfri@kth.se" }]
+dependencies = [
+    "ipykernel>=7.1.0",
+    "jax[cuda13]>=0.8.0",
+    "flax[all]>=0.12.0",
+    "datasets>=4.3.0",
+    "Pillow>=12.0.0",
+    "grain>=0.2.14",
+    "matplotlib>=3.10.7",
 ]
-dependencies = ["ipykernel>=7.1.0", "jax>=0.8.0", "flax[all]>=0.12.0", "datasets>=4.3.0", "Pillow>=12.0.0"]
 requires-python = "==3.13.*"
 readme = "README.md"
-license = {text = "MIT"}
-
-
-[tool.pdm]
-distribution = false
+license = { text = "MIT" }
