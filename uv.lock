@@ -820,6 +820,7 @@ dependencies = [
     { name = "ipykernel" },
     { name = "jax", extra = ["cuda13"] },
     { name = "matplotlib" },
+    { name = "orbax" },
     { name = "pillow" },
 ]
 
@@ -831,6 +832,7 @@ requires-dist = [
     { name = "ipykernel", specifier = ">=7.1.0" },
     { name = "jax", extras = ["cuda13"], specifier = ">=0.8.0" },
     { name = "matplotlib", specifier = ">=3.10.7" },
+    { name = "orbax", specifier = ">=0.1.9" },
     { name = "pillow", specifier = ">=12.0.0" },
 ]
 
@@ -1207,6 +1209,15 @@ sdist = { url = "https://files.pythonhosted.org/packages/6d/3b/90c11f740a3538200
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b8/ec/19c6cc6064c7fc8f0cd6d5b37c4747849e66040c6ca98f86565efc2c227c/optax-0.2.6-py3-none-any.whl", hash = "sha256:f875251a5ab20f179d4be57478354e8e21963373b10f9c3b762b94dcb8c36d91", size = 367782, upload-time = "2025-09-15T22:41:22.825Z" },
 ]
+
+[[package]]
+name = "orbax"
+version = "0.1.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "orbax-checkpoint" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c7/78/0e144f12703c95d4495e9abc390c2f548ee9f24d2e487137108a921b1d81/orbax-0.1.9.tar.gz", hash = "sha256:42dd487ceef9fbf027f4720f3d041686af75120466a528a8a8141226bc197218", size = 1649, upload-time = "2023-09-06T20:43:02.819Z" }
 
 [[package]]
 name = "orbax-checkpoint"
