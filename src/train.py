@@ -44,7 +44,8 @@ def create_training_mask(rng, batch_size, seq_len, min_mask_rate=0.45):
     rng_r, rng_mask = jax.random.split(rng)
 
     # magic number given by 1 - (arccos(0.45)2/π)
-    r = jax.random.uniform(0.297,1)
+
+    r = jax.random.uniform(key=rng_r,shape=(batch_size,),minval=0.297,maxval=1.0)
     
     # Compute Mask Ratio (Cosine Schedule)
     mask_ratio = jnp.cos((1-r) * jnp.pi / 2)
