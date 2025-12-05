@@ -11,7 +11,6 @@ import losses
 from maskgit_class_cond_config import get_config
 
 # --- CONFIG ---
-# You need to install optax: pip install optax
 config = get_config()
 CODEBOOK_SIZE = 1000 # FSQ vocabulary size
 MASK_TOKEN_ID = 1000 # The index used for masking
@@ -29,7 +28,7 @@ def create_train_state(rng, learning_rate):
         hidden_dropout_prob=config.transformer.dropout_rate
     )
     
-    # Dummy inputs for initialization
+    # temp inputs for initialization
     dummy_tokens = jnp.ones((1, 256), dtype=jnp.int32)
     dummy_labels = jnp.ones((1,), dtype=jnp.int32)
     
@@ -107,12 +106,12 @@ if __name__ == "__main__":
     
     print("Model initialized. Starting simulated loop...")
     
-    # Placeholder for your friends' data loader
-    # You need to replace this loop with real data loading
+    
+    # replace this loop with real data loading
     for step in range(100):
         rng, step_rng = jax.random.split(rng)
         
-        # Fake Data (Replace with real FSQ tokens)
+        # Fake Data (to be FSQ tokens)
         fake_batch = {
             'tokens': jax.random.randint(step_rng, (32, 256), 0, CODEBOOK_SIZE),
             'labels': jax.random.randint(step_rng, (32,), 0, config.num_class)
