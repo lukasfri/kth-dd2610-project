@@ -42,10 +42,12 @@ def create_training_mask(rng, batch_size, seq_len, min_mask_rate=0.45):
     # Sample r uniformly from [0.45, 1.0]
     # stabalisation from paper
     rng_r, rng_mask = jax.random.split(rng)
-    r = jax.random.uniform(rng_r, (batch_size,)) * (1. - min_mask_rate) + min_mask_rate
+
+    # magic number given by 1 - (arccos(0.45)2/π)
+    r = jax.random.uniform(0.297, (batch_size,))
     
     # Compute Mask Ratio (Cosine Schedule)
-    mask_ratio = jnp.cos(r * jnp.pi / 2)
+    mask_ratio = jnp.cos((1-r) * jnp.pi / 2)
     num_masked = jnp.floor(mask_ratio * seq_len).astype(jnp.int32)
     
     # Create Random Masks
