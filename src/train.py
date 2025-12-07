@@ -10,11 +10,63 @@ import maskgit_transformers
 import losses
 from maskgit_class_cond_config import get_config
 
+import numpy as np 
+from typing import Mapping, Any, Tuple
+import itertools
+import hashlib
+from tqdm import tqdm
+
 # --- CONFIG ---
 config = get_config()
 CODEBOOK_SIZE = 1000 # FSQ vocabulary size
 MASK_TOKEN_ID = 1000 # The index used for masking
 UNCOND_LABEL = config.num_class # The index for dropped labels (10)
+BATCH_SIZE = config.batch_size 
+SEQUENCE_LENGTH = 64 
+
+# ===== DATA =====
+
+def load_numpy_data(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    print(f"Loading data from {file_path}...")
+    data = np.load(file_path)
+    all_tokens = data['tokens']
+    all_labels = data['labels']
+    
+    print(f"Loaded {all_tokens.shape[0]} total examples.")
+    return all_tokens, all_labels
+
+def create_numpy_data_iterator(all_tokens: np.ndarray, all_labels: np.ndarray, 
+                               rng_key: jax.random.PRNGKey, batch_size: int):
+    """
+    A simple Python generator function for infinite, shuffled batch streaming.
+    """
+    num_examples = all_tokens.shape[0]
+    num_batches = num_examples // batch_size
+    indices = np.arange(num_examples)
+
+    for epoch in itertools.cycle(range(1)): 
+        
+        # shuffling
+        rng_key, shuffle_key = jax.random.split(rng_key)
+        key_bytes = shuffle_key.tobytes()
+        seed = int.from_bytes(hashlib.sha256(key_bytes).digest()[:4], byteorder='little')
+        
+        np.random.seed(seed)
+        np.random.shuffle(indices)
+        
+        # BATCH
+        for i in range(num_batches):
+            batch_indices = indices[i * batch_size : (i + 1) * batch_size]
+            
+            batch_tokens_np = all_tokens[batch_indices]
+            batch_labels_np = all_labels[batch_indices]
+            
+            # Convert to JAX arrays
+            yield {
+                'tokens': jnp.asarray(batch_tokens_np),
+                'labels': jnp.asarray(batch_labels_np)
+            }
+        
 
 # --- SETUP MODEL ---
 def create_train_state(rng, learning_rate):
@@ -29,7 +81,7 @@ def create_train_state(rng, learning_rate):
     )
     
     # temp inputs for initialization
-    dummy_tokens = jnp.ones((1, 256), dtype=jnp.int32)
+    dummy_tokens = jnp.ones((1, SEQUENCE_LENGTH), dtype=jnp.int32)
     dummy_labels = jnp.ones((1,), dtype=jnp.int32)
     
     params = model.init(rng, dummy_tokens, dummy_labels, deterministic=True)['params']
@@ -75,7 +127,7 @@ def train_step(state, batch, rng):
     mask_bool = create_training_mask(rng_mask, tokens.shape[0], tokens.shape[1])
     masked_tokens = jnp.where(mask_bool, MASK_TOKEN_ID, tokens)
     
-    # Classifier-Free Guidance: Drop labels 10% of the time
+    # Classifier-Free Guidance: Drop labels 10% of the piptime
     drop_mask = jax.random.bernoulli(rng_drop, p=0.1, shape=(tokens.shape[0],))
     cond_labels = jnp.where(drop_mask, UNCOND_LABEL, labels)
     
@@ -106,22 +158,40 @@ def train_step(state, batch, rng):
 # --- MAIN EXECUTION SKELETON ---
 if __name__ == "__main__":
     rng = jax.random.PRNGKey(0)
-    state = create_train_state(rng, config.optimizer.lr)
     
+    
+    data_path = 'cifar10_tokens.npz' 
+    all_tokens, all_labels = load_numpy_data(data_path)
+
+    
+    rng, init_rng, data_rng = jax.random.split(rng, 3)
+
+    state = create_train_state(init_rng, config.optimizer.lr)
+
+    data_iterator = create_numpy_data_iterator(
+        all_tokens=all_tokens, 
+        all_labels=all_labels,
+        rng_key=data_rng,
+        batch_size=BATCH_SIZE
+    )
     print("Model initialized. Starting simulated loop...")
     
     
-    # replace this loop with real data loading
-    for step in range(100):
+    # TRAINING LOOP
+    for step in tqdm(range(config.num_train_steps), desc="Training"):
         rng, step_rng = jax.random.split(rng)
         
-        # Fake Data (to be FSQ tokens)
-        fake_batch = {
-            'tokens': jax.random.randint(step_rng, (32, 256), 0, CODEBOOK_SIZE),
-            'labels': jax.random.randint(step_rng, (32,), 0, config.num_class)
-        }
+
+        try:
+            batch = next(data_iterator)
+        except StopIteration:
+
+            print("\nError: Data iterator stopped")
+            break 
+            
+        state, loss = train_step(state, batch, step_rng)
         
-        state, loss = train_step(state, fake_batch, step_rng)
-        
-        if step % 10 == 0:
-            print(f"Step {step}, Loss: {loss:.4f}")
+        if step % 100 == 0:
+            tqdm.write(f"Step {step:7d}, Loss: {loss:.4f}")
+
+            
