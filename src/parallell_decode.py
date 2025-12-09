@@ -56,15 +56,17 @@ def mask_by_random_topk(rng, mask_len, probs, temperature=1.0):
   return masking
 
 
+# This code is taken from the maskGit repo but due to some error I will change DeviceArray to ndarray
+
 @flax.struct.dataclass
 class State:
   """Holds decoding state data."""
   # The position of the decoding loop in the length dimension.
-  cur_index: jnp.DeviceArray  # scalar int32: current decoded length index
+  cur_index: jnp.ndarray  # scalar int32: current decoded length index
   # The active sequence log probabilities and finished sequence scores.
-  cur_seqs: jnp.DeviceArray  # int32 [batch, seq_len]
-  rng: jnp.DeviceArray  # Sampling random state.
-  final_seqs: jnp.DeviceArray  # int32 [batch, num_iter, seq_len]
+  cur_seqs: jnp.ndarray  # int32 [batch, seq_len]
+  rng: jnp.ndarray  # Sampling random state.
+  final_seqs: jnp.ndarray  # int32 [batch, num_iter, seq_len]
 
 
 def state_init(init_indices, rng, num_iter, start_iter=0):
