@@ -6,9 +6,16 @@ import optax
 import os
 import time
 
-# Flax utilities for loading the trained model
+# Flax utilities for loading the MaskGIT model
 from flax.training import checkpoints
 from flax.training import train_state
+
+# --- FSQ / NNX Imports ---
+from flax import nnx
+import orbax.checkpoint as ocp
+from orbax.checkpoint.checkpoint_managers import preservation_policy as ocp_pp
+from typing import Optional, Callable, TypedDict, Literal, TypeVar, Generic, Any
+from abc import ABC, abstractmethod
 
 # Import your local files
 import maskgit_class_cond_config as config
@@ -16,26 +23,194 @@ import maskgit_transformers as transformer
 import parallell_decode
 
 # --- CONSTANTS DERIVED FROM TRAINING SCRIPT ---
-# The FSQ vocabulary size used in the training script
 CODEBOOK_SIZE = 512
-# The mask ID is one index past the codebook
 MASK_TOKEN_ID = 512 
-# The sequence length L is 64 (8x8) based on dummy inputs in create_train_state
 TRAINING_SEQ_LEN = 64
 
+# ==============================================================================
+# ========================== 1. FSQ-VAE MODEL DEFINITIONS ======================
+# ==============================================================================
 
-# --- STAGE II: TRANSFORMER MODEL LOADING (FINAL CORRECTED VERSION) ---
+# Helper functions needed for FSQ-VAE
+def get_norm_layer(norm_type: Literal["BN", "LN", "GN"], num_features: int, rngs: nnx.Rngs) -> Callable[[jax.Array], jax.Array]:
+    if norm_type == 'LN':
+        return nnx.LayerNorm(num_features=num_features, rngs=rngs)
+    elif norm_type == 'GN':
+        return nnx.GroupNorm(num_features=num_features, rngs=rngs)
+    else:
+        raise NotImplementedError(f"Norm type {norm_type} not implemented")
 
+def upsample_2d(x: jax.Array, factor: int = 2) -> jax.Array:
+    n, h, w, c = x.shape
+    return jax.image.resize(x, (n, h * factor, w * factor, c), method='nearest')
+
+class ResBlock(nnx.Module):
+    def __init__(self, in_features: int, out_features: int, norm_type: Literal['BN', 'LN', 'GN'], activation_fn: Callable, rngs: nnx.Rngs):
+        self.norm_1 = get_norm_layer(norm_type, in_features, rngs)
+        self.activation_fn1 = activation_fn
+        self.conv_1 = nnx.Conv(in_features, kernel_size=(3, 3), use_bias=False, out_features=out_features, rngs=rngs)
+        self.norm_2 = get_norm_layer(norm_type, out_features, rngs)
+        self.activation_fn2 = activation_fn
+        self.conv_2 = nnx.Conv(out_features, kernel_size=(3, 3), use_bias=False, out_features=out_features, rngs=rngs)
+        self.residual_conv = nnx.Conv(in_features, kernel_size=(1, 1), use_bias=False, out_features=out_features, rngs=rngs)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        residual = x
+        x = self.norm_1(x)
+        x = self.activation_fn1(x)
+        x = self.conv_1(x)
+        x = self.norm_2(x)
+        x = self.activation_fn2(x)
+        x = self.conv_2(x)
+        if residual.shape[-1] != x.shape[-1]:
+            residual = self.residual_conv(residual)
+        return x + residual
+
+def multi_resblock(num_blocks: int, in_features: int, out_features: int, norm_type: str, activation_fn: Callable, rngs: nnx.Rngs) -> nnx.Sequential:
+    return nnx.Sequential(*[
+        ResBlock(in_features=in_features if i == 0 else out_features, out_features=out_features, norm_type=norm_type, activation_fn=activation_fn, rngs=rngs)
+        for i in range(num_blocks)
+    ])
+
+class Decoder(nnx.Module):
+    def __init__(self, embedding_dim: int, filters: int, num_res_blocks: int, channel_multipliers: list[int], image_channels: int, norm_type: str, rngs: nnx.Rngs, activation_fn=nnx.swish):
+        self.norm_layer = get_norm_layer(norm_type, filters, rngs)
+        self.activation_fn = activation_fn
+        self.initial_conv = nnx.Conv(in_features=embedding_dim, kernel_size=(3, 3), use_bias=True, out_features=filters * channel_multipliers[-1], rngs=rngs)
+        
+        self.initial_res_blocks = multi_resblock(num_blocks=num_res_blocks, in_features=filters * channel_multipliers[-1], out_features=filters * channel_multipliers[-1], norm_type=norm_type, activation_fn=activation_fn, rngs=rngs)
+        
+        layers = []
+        for i in reversed(range(len(channel_multipliers))):
+            layers.append(multi_resblock(
+                num_blocks=num_res_blocks,
+                in_features=filters * channel_multipliers[i],
+                out_features=filters * channel_multipliers[i-1] if i > 0 else filters,
+                norm_type=norm_type, activation_fn=activation_fn, rngs=rngs
+            ))
+            if i > 0:
+                layers.append(lambda x: upsample_2d(x, 2))
+                layers.append(nnx.Conv(
+                    in_features=filters * channel_multipliers[i-1] if i > 0 else filters,
+                    out_features=filters * channel_multipliers[i-1] if i > 0 else filters,
+                    kernel_size=(3, 3), rngs=rngs
+                ))
+        self.decoder_blocks = nnx.Sequential(*layers)
+        self.final_conv = nnx.Conv(in_features=filters, out_features=image_channels, kernel_size=(3, 3), rngs=rngs)
+
+    def __call__(self, x):
+        x = self.initial_conv(x)
+        x = self.initial_res_blocks(x)
+        x = self.decoder_blocks(x)
+        x = self.norm_layer(x)
+        x = self.activation_fn(x)
+        x = self.final_conv(x)
+        return x
+
+T = TypeVar('T')
+
+class Quantizer(ABC, Generic[T]):
+    @abstractmethod
+    def decode_from_idx(self, ids: jax.Array) -> jax.Array:
+        pass
+
+class FiniteScalarQuantizer(nnx.Module, Quantizer[None]):
+    latent_dim: int
+    L: jax.Array
+    
+    def __init__(self, L: list[int]):
+        self.latent_dim = len(L)
+        self.L = jnp.array(L, dtype=jnp.int32)
+        
+    def q_func(self, x: jax.Array) -> jax.Array:
+        L_broadcast = self.L[None, :] 
+        return jnp.tanh(x) * jnp.floor(L_broadcast / 2)
+
+    def __call__(self, z: jax.Array) -> tuple[jax.Array, None]:
+        B, H, W, D = z.shape
+        z_flat = z.reshape((B * H * W, D))
+        z_q_flat = jnp.round(self.q_func(z_flat))
+        z_q = z_q_flat.reshape((B, H, W, D))
+        return z_q, None
+    
+    def decode_from_idx(self, ids: jax.Array) -> jax.Array:
+        """
+        Converts flat indices (0..CODEBOOK_SIZE-1) back to quantized vectors.
+        """
+        # 1. Unravel the flat index into multi-dimensional indices based on L
+        coords = jnp.unravel_index(ids, self.L) # Tuple of arrays
+        
+        # Stack coordinates to shape [..., D]
+        coords = jnp.stack(coords, axis=-1)
+        
+        # 2. Shift coordinates to be centered around 0 (FSQ logic)
+        shifts = jnp.floor(self.L / 2)
+        quantized_vectors = coords - shifts
+        
+        return quantized_vectors.astype(jnp.float32)
+
+class Encoder(nnx.Module):
+    def __init__(self, *args, **kwargs): pass
+    def __call__(self, x): return x
+
+class VQVAE(nnx.Module, Generic[T]):
+    quantizer: Quantizer[T]
+    encoder: Encoder
+    decoder: Decoder
+
+    def __init__(self, config: dict, quantizer: Quantizer[T], rngs: nnx.Rngs):
+        embedding_dim = len(config['codebook_shape'])
+        self.quantizer = quantizer
+        self.encoder = Encoder() # Dummy encoder
+        self.decoder = Decoder(
+            embedding_dim=embedding_dim,
+            filters=config['filters'],
+            num_res_blocks=config['num_res_blocks'],
+            channel_multipliers=config['channel_multipliers'],
+            image_channels=config['image_channels'],
+            norm_type=config['norm_type'],
+            rngs=rngs
+        )
+
+    def decode_from_indices(self, z_ids: jax.Array) -> jax.Array:
+        z_vectors = self.quantizer.decode_from_idx(z_ids)
+        reconstructed_image = self.decoder(z_vectors)
+        return reconstructed_image
+
+# FSQ Configuration
+class Config(TypedDict):
+    id: str
+    codebook_shape: list[int]
+    filters: int
+    num_res_blocks: int
+    channel_multipliers: list[int]
+    norm_type: str
+    quantizer_type: str
+    image_channels: int
+
+fsqvae_config = Config({
+    "id": "fsqvae",
+    "codebook_shape": [8, 8, 8], # Produces 512 codes
+    "filters": 128,
+    "num_res_blocks": 2,
+    "channel_multipliers": [1, 2, 4],
+    "norm_type": "LN",
+    "quantizer_type": "fsq",
+    "image_channels": 3,
+})
+
+
+# ==============================================================================
+# ========================== 2. MODEL LOADING LOGIC ============================
+# ==============================================================================
+
+# --- STAGE II: TRANSFORMER MODEL LOADING ---
 def load_inference_model(config_obj, checkpoint_dir, step=None):
-    """
-    Loads the trained MaskGIT Transformer model parameters from a checkpoint
-    saved using the flax.training.checkpoints utility.
-    """
+    """Loads the trained MaskGIT Transformer model parameters."""
     print(f"Loading MaskGIT Transformer model from directory: {checkpoint_dir}")
     
-    # 1. Define the model architecture (must match the training script exactly)
     model = transformer.Transformer(
-        vocab_size=CODEBOOK_SIZE + 1, # +1 for the mask token
+        vocab_size=CODEBOOK_SIZE + 1,
         num_classes=config_obj.num_class,
         hidden_size=config_obj.transformer.num_embeds,
         num_hidden_layers=config_obj.transformer.num_layers,
@@ -43,371 +218,204 @@ def load_inference_model(config_obj, checkpoint_dir, step=None):
         intermediate_size=config_obj.transformer.intermediate_size,
         hidden_dropout_prob=config_obj.transformer.dropout_rate
     )
-
-    print("Transformer model architecture instantiated.")
-
-    # 2. Re-create the initial TrainState structure (the "target" for loading)
+    
     rng_key = jax.random.PRNGKey(0)
     dummy_tokens = jnp.ones((1, TRAINING_SEQ_LEN), dtype=jnp.int32)
     dummy_labels = jnp.ones((1,), dtype=jnp.int32)
 
-    # Initialize parameters (needed to set the structure/shapes)
-    initial_params = model.init(
-        rng_key, dummy_tokens, dummy_labels, deterministic=True
-    )['params']
+    initial_params = model.init(rng_key, dummy_tokens, dummy_labels, deterministic=True)['params']
     
-    # --- DEBUG STEP 1: CALCULATE HASH/SUM OF INITIAL PARAMETERS (ROBUST FIX) ---
-    
-    # Helper function to safely find the token embedding table sum
-    def get_embedding_sum(params):
-        # 1. Access the Transformer's parameters (look for top-level keys)
-        transformer_params = params.get('Transformer_0', params) 
-
-        # 2. Find the *parent* layer named for token embedding
-        if 'token_embed' in transformer_params:
-            parent_module_params = transformer_params['token_embed']
-        elif 'Embed_0' in transformer_params:
-            parent_module_params = transformer_params['Embed_0']
-        else:
-            try: # Fallback for a heavily nested structure
-                parent_module_params = params['params']['token_embed']
-            except KeyError:
-                 raise KeyError("Could not find a parameter module named 'token_embed' or 'Embed_0' in the Transformer structure.")
-        
-        # 3. Find the *word embeddings* sub-module 
-        if 'word_embeddings' in parent_module_params:
-            word_embed_params = parent_module_params['word_embeddings']
-        else:
-            raise KeyError("Expected 'word_embeddings' key inside the embedding parent module, but not found.")
-
-        # 4. Find the final weight tensor inside the sub-module (THE ROBUST FIX)
-        final_param_key_candidates = ['kernel', 'embedding', 'w'] 
-        embedding_table = word_embed_params
-        
-        # Iteratively try to drill down until we hit a JAX array (or fail)
-        for _ in range(3): # Try up to three levels of nesting
-            if not isinstance(embedding_table, dict):
-                break # Found the array (or non-dict), exit loop
-
-            # Check for candidate keys at the current level
-            found_key = False
-            for key in final_param_key_candidates:
-                if key in embedding_table:
-                    embedding_table = embedding_table[key]
-                    found_key = True
-                    break
-            
-            # If no candidate key was found, but only one key exists, assume it's the next nested module
-            if not found_key and len(embedding_table) == 1:
-                # Drill down into the single existing key
-                embedding_table = list(embedding_table.values())[0]
-                found_key = True
-            
-            if not found_key:
-                # If we're still a dict and couldn't drill down, raise error
-                available_keys = list(embedding_table.keys())
-                raise KeyError(
-                    f"Could not resolve the final array in 'word_embeddings'. Last checked keys: {available_keys}"
-                )
-        
-        # Final check and return
-        if hasattr(embedding_table, 'sum'): 
-            return float(jnp.sum(embedding_table))
-        
-        raise TypeError(f"Final object is not a JAX array but a {type(embedding_table)}.")
-
-    try:
-        initial_sum = get_embedding_sum(initial_params)
-    except Exception as e:
-        print(f"FATAL DEBUG ERROR: Could not access initial token embedding. Error: {e}")
-        # The JAX error happens inside this try/except block.
-        # We raise the exception to see the custom KeyError if it triggers, 
-        # or the JAX error if it fails on the final sum.
-        raise e 
-        
-    print(f"DEBUG: Initial random embedding sum: {initial_sum:.6f}")
-    
-    # Create a dummy optimizer and TrainState structure
     dummy_tx = optax.adamw(learning_rate=1e-3) 
     initial_state = train_state.TrainState.create(
         apply_fn=model.apply, params=initial_params, tx=dummy_tx
     )
     
-    # 3. Load the checkpoint file
-    print("Attempting to restore parameters...")
-    
-    # Normalize checkpoint directory to an absolute path (Orbax requires absolute paths)
+    print("Attempting to restore MaskGIT parameters...")
     checkpoint_dir = os.path.abspath(checkpoint_dir)
-
-    # First try the simple flax checkpoints loader (works if training used flax.checkpoints)
-    loaded_state = None
-    try:
-        loaded_state = checkpoints.restore_checkpoint(
-            ckpt_dir=checkpoint_dir,
-            target=initial_state,
-            step=step,
-            prefix="maskgit_",
-        )
-        print("flax.training.checkpoints.restore_checkpoint returned without exception.")
-    except Exception as e:
-        print(f"flax.restore_checkpoint failed with: {e}")
-
-    # If flax restore didn't find a valid checkpoint (or resulted in random params),
-    # detect Orbax/ocdbt checkpoint layout and try Orbax restore as a fallback.
-    def _looks_like_orbax(dirpath: str) -> bool:
-        # orbax checkpoints contain manifest.ocdbt or _CHECKPOINT_METADATA or ocdbt.process_*
-        return (
-            os.path.exists(os.path.join(dirpath, "manifest.ocdbt"))
-            or os.path.exists(os.path.join(dirpath, "_CHECKPOINT_METADATA"))
-            or os.path.exists(os.path.join(dirpath, "ocdbt.process_0"))
-        )
-
-    # Helper to extract params from a restored object (TrainState, dict, etc.)
-    def _extract_params(restored_obj):
-        # Direct attribute
-        if hasattr(restored_obj, 'params'):
-            return restored_obj.params
-        # dict-like
-        if isinstance(restored_obj, dict):
-            if 'params' in restored_obj:
-                return restored_obj['params']
-            # sometimes nested under 'target' or similar
-            if 'target' in restored_obj and isinstance(restored_obj['target'], dict) and 'params' in restored_obj['target']:
-                return restored_obj['target']['params']
-            # try to find any nested params key
-            for v in restored_obj.values():
-                try:
-                    p = _extract_params(v)
-                    if p is not None:
-                        return p
-                except Exception:
-                    continue
-        raise KeyError('Could not extract `params` from restored checkpoint object.')
-
-    # Decide whether to attempt orbax restore
-    try_orbax = False
-    if loaded_state is None:
-        try_orbax = True
-    else:
-        try:
-            loaded_params_tmp = _extract_params(loaded_state)
-            # If the sums match the initial random init, we'll treat as failed load
-            try:
-                loaded_sum_tmp = get_embedding_sum(loaded_params_tmp)
-                if np.isclose(initial_sum, loaded_sum_tmp):
-                    print("Loaded params appear identical to random init (sum match) — will try Orbax fallback if available.")
-                    try_orbax = True
-            except Exception:
-                # Could not compute sum; still consider trying orbax if layout present
-                try_orbax = try_orbax or _looks_like_orbax(checkpoint_dir)
-        except Exception:
-            try_orbax = True
-
-    if try_orbax and _looks_like_orbax(checkpoint_dir):
-        print("Detected Orbax/ocdbt checkpoint layout — attempting Orbax restore...")
-        try:
-            import orbax.checkpoint as ocp
-        except Exception as e:
-            print(f"Failed to import orbax.checkpoint: {e}")
-            raise
-
-        # Create a manager and restore the latest step
-        try:
-            manager = ocp.CheckpointManager(checkpoint_dir)
-            step_to_restore = manager.latest_step()
-            if step_to_restore is None:
-                raise FileNotFoundError(f"No checkpoint step found in {checkpoint_dir}")
-
-            print(f"Restoring Orbax checkpoint at step {step_to_restore} from {checkpoint_dir}...")
-            restored = manager.restore(step_to_restore, args=ocp.args.StandardRestore(initial_state))
-            loaded_state = restored
-            print("Orbax restore completed (returned object assigned to loaded_state).")
-        except Exception as e:
-            print(f"Orbax restore failed: {e}")
-            # propagate original exception if nothing worked
-            if loaded_state is None:
-                raise
+    loaded_state = checkpoints.restore_checkpoint(
+        ckpt_dir=checkpoint_dir, target=initial_state, step=step, prefix="maskgit_"
+    )
     
-    # 4. Extract the necessary components and perform the check
+    # Fallback to Orbax if needed
+    if loaded_state is initial_state: 
+         if os.path.exists(os.path.join(checkpoint_dir, "manifest.ocdbt")) or os.path.exists(os.path.join(checkpoint_dir, "checkpoint")): 
+            print("Trying Orbax restore for Transformer...")
+            mgr = ocp.CheckpointManager(checkpoint_dir)
+            step = mgr.latest_step()
+            loaded_state = mgr.restore(step, args=ocp.args.StandardRestore(initial_state))
+
     loaded_params = loaded_state.params
-    
-    # --- DEBUG STEP 2 & 3: CALCULATE AND COMPARE HASH/SUM OF LOADED PARAMETERS ---
-    # This also uses the robust get_embedding_sum
-    loaded_sum = get_embedding_sum(loaded_params)
-    
-    # Compare the sums
-    if np.isclose(initial_sum, loaded_sum):
-        print("🛑 ---------------------------------------------------------------------------------")
-        print("🛑 WARNING: Checkpoint load FAILED. Parameters are RANDOM or CHECKPOINT IS MISSING.")
-        print("🛑 Sums are the same. Please verify `checkpoint_dir` contains the trained files.")
-        print("🛑 ---------------------------------------------------------------------------------")
-    else:
-        print("✅ Checkpoint load SUCCESS.")
-        print(f"DEBUG: Loaded embedding sum: {loaded_sum:.6f} (Different from initial)")
-    
-    print("Model parameters initialized (or loaded) and JAX structure confirmed.")
-    
+    print("MaskGIT Model loaded.")
     return model, loaded_params
 
+# --- STAGE I: FSQ MODEL LOADING ---
+def load_fsq_model(model_dir: str):
+    """Loads the FSQ-VAE model using NNX and Orbax."""
+    print(f"Loading FSQ-VAE model from: {model_dir}")
+    
+    def create_model(cfg, rngs):
+        quantizer = FiniteScalarQuantizer(L=cfg['codebook_shape'])
+        return VQVAE(config=cfg, quantizer=quantizer, rngs=rngs)
 
-# --- STAGE I: FSQ DECODER PLACEHOLDER (Needs implementation later) ---
+    # 1. Create Abstract Model
+    abstract_model = nnx.eval_shape(lambda: create_model(fsqvae_config, nnx.Rngs(0)))
+    graphdef, abstract_state = nnx.split(abstract_model)
+
+    # 2. Setup Orbax Manager
+    ckpt_path = os.path.join(model_dir, "named", fsqvae_config["id"])
+    if not os.path.exists(ckpt_path):
+        # Fallback to direct path
+        ckpt_path = model_dir
+    
+    print(f"Looking for FSQ checkpoints in: {ckpt_path}")
+    manager = ocp.CheckpointManager(ckpt_path)
+    step_to_restore = manager.latest_step()
+
+    if step_to_restore is None:
+        raise FileNotFoundError(f"No FSQ checkpoint found in {ckpt_path}")
+
+    # 3. Restore
+    print(f"Restoring FSQ at step {step_to_restore}...")
+    restored_state = manager.restore(step_to_restore, args=ocp.args.StandardRestore(abstract_state))
+    
+    # 4. Merge back into a runnable model
+    fsq_model = nnx.merge(graphdef, restored_state)
+    fsq_model.eval() 
+    print("FSQ-VAE Model loaded successfully.")
+    
+    return fsq_model
+
+# ==============================================================================
+# ========================== 3. INFERENCE LOGIC ================================
+# ==============================================================================
 
 def decode_tokens_to_image(tokens, fsq_decoder_module):
     """
-    PLACEHOLDER: This function requires the FSQ Decoder (Stage I) model 
-    and parameters to convert discrete tokens into image pixels.
+    Decodes discrete tokens [B, L] into images [B, H, W, 3] using the FSQ model.
+    Handles None decoder by returning black images.
+    Blocks until GPU is done to avoid hanging later.
     """
-    # Reshape the tokens from (B, L) to (B, H, W)
-    h = w = int(jnp.sqrt(tokens.shape[-1]))
-    latent_indices = tokens.reshape(tokens.shape[0], h, w)
-    
-    # NOTE: This is where you would call the FSQ Decoder model.apply(...)
-    
-    print(f"Tokens decoded. Final shape: {latent_indices.shape}. Ready for FSQ Decoder.")
-    # Returns a black placeholder image array
-    print("Starting FSQ decoding of tokens...")
     t0 = time.time()
+    
+    # Reshape tokens: [B, 64] -> [B, 8, 8] assuming 8x8 latent grid
+    b, l = tokens.shape
+    h = w = int(np.sqrt(l)) 
+    latent_indices = tokens.reshape(b, h, w)
+    
+    print(f"Tokens prepared for FSQ. Shape: {latent_indices.shape}")
 
-    # If no FSQ decoder supplied, return placeholder images and log time.
+    # --- CASE 1: No FSQ Model ---
     if fsq_decoder_module is None:
-        out = jnp.zeros((tokens.shape[0], h * 16, w * 16, 3), dtype=jnp.float32)
-        print(f"No FSQ decoder provided — returning placeholder images. Took {time.time() - t0:.3f}s")
-        return out
+        print("No FSQ decoder provided. Generating placeholder (black) images...")
+        # Assume 16x upsampling (8x8 -> 128x128)
+        images = jnp.zeros((b, h * 16, w * 16, 3), dtype=jnp.float32)
+        # CRITICAL: Wait for this array to exist
+        images.block_until_ready()
+        print(f"Placeholder generation took {time.time() - t0:.3f}s")
+        return images
 
-    # If a decoder is provided, expect either:
-    #  - a tuple (model, params)
-    #  - or an object with `.apply(params, inputs)` behavior
+    # --- CASE 2: FSQ Model Present ---
     try:
-        if isinstance(fsq_decoder_module, tuple) and len(fsq_decoder_module) == 2:
-            model, params = fsq_decoder_module
-            seq_len = tokens.shape[-1]
-            side = int(np.sqrt(seq_len))
-            token_inputs = tokens.reshape((tokens.shape[0], side, side)) if tokens.ndim == 2 else tokens
+        @nnx.jit
+        def _decode(model, idxs):
+            return model.decode_from_indices(idxs)
 
-            # Prefer a dedicated `decode` method if present
-            if hasattr(model, 'decode'):
-                images = model.apply({'params': params}, token_inputs, method=model.decode)
-            else:
-                images = model.apply({'params': params}, token_inputs)
+        print("JIT Compiling and Running FSQ Decoder...")
+        images = _decode(fsq_decoder_module, latent_indices)
+        
+        print("Waiting for GPU to finish FSQ decoding...")
+        # CRITICAL: Wait for computation
+        images.block_until_ready()
+        
+        print(f"Output Image Shape: {images.shape}")
 
-            images = jnp.array(images, dtype=jnp.float32)
-            print(f"FSQ decoding completed in {time.time() - t0:.3f}s")
-            return images
-        else:
-            # Try generic apply
-            seq_len = tokens.shape[-1]
-            side = int(np.sqrt(seq_len))
-            token_inputs = tokens.reshape((tokens.shape[0], side, side)) if tokens.ndim == 2 else tokens
-            images = fsq_decoder_module.apply({'params': fsq_decoder_module.params}, token_inputs)
-            images = jnp.array(images, dtype=jnp.float32)
-            print(f"FSQ decoding completed in {time.time() - t0:.3f}s")
-            return images
+        # Normalize [-1, 1] -> [0, 1]
+        images = (images + 1.0) / 2.0
+        images = jnp.clip(images, 0.0, 1.0)
+        
+        print(f"Decoding done in {time.time() - t0:.3f}s")
+        return images
+
     except Exception as e:
-        print(f"FSQ decoding failed: {e}")
-        out = jnp.zeros((tokens.shape[0], h * 16, w * 16, 3), dtype=jnp.float32)
-        print(f"Returning placeholder images. Took {time.time() - t0:.3f}s")
-        return out
+        print(f"FSQ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        # Fallback to black image
+        fallback = jnp.zeros((b, h * 16, w * 16, 3), dtype=jnp.float32)
+        fallback.block_until_ready()
+        return fallback
 
 def save_image(image, filename):
-    """
-    PLACEHOLDER: Saves the resulting JAX array as an image file (e.g., PNG).
-    """
-    print(f"Saving generated image to {filename}...")
-    try:
-        # Convert to numpy
-        arr = np.array(image)
-        # Handle float arrays in [0,1]
-        if arr.dtype == np.float32 or arr.dtype == np.float64:
-            arr = np.clip(arr, 0.0, 1.0)
-            arr = (arr * 255).astype(np.uint8)
-        else:
-            arr = arr.astype(np.uint8)
-
-        # Remove channel dim if single-channel
-        if arr.ndim == 3 and arr.shape[2] == 1:
-            arr = arr.squeeze(-1)
-
-        # Lazy import of PIL or fallback to imageio
-        try:
-            from PIL import Image
-            Image.fromarray(arr).save(filename)
-        except Exception:
-            try:
-                import imageio
-                imageio.imwrite(filename, arr)
-            except Exception as e:
-                print(f"Failed to save image to {filename}: {e}")
-    except Exception as e:
-        print(f"save_image() error for {filename}: {e}")
+    print(f"Saving {filename}...")
+    # Convert to numpy (this will be fast because we blocked previously)
+    arr = np.array(image)
     
-# -----------------------------------------------------------------------------
+    if arr.dtype == np.float32 or arr.dtype == np.float64:
+        arr = np.clip(arr, 0.0, 1.0)
+        arr = (arr * 255).astype(np.uint8)
+    
+    if arr.ndim == 3 and arr.shape[2] == 1:
+        arr = arr.squeeze(-1)
+
+    from PIL import Image
+    try:
+        Image.fromarray(arr).save(filename)
+    except Exception as e:
+        print(f"Failed to save {filename}: {e}")
 
 def run_generation(
     target_class_id: int, 
     batch_size: int = 4, 
     num_steps: int = 12, 
-    checkpoint_dir: str = './checkpoints4'
+    checkpoint_dir: str = './checkpoints4',
+    fsq_model_dir: str = './models'
 ):
     """Runs the scheduled parallel decoding process."""
     
-    # Load configuration
+    # 1. Load Config
     config_obj = config.get_config()
     
-    # Load stuff
+    # 2. Load MaskGIT (Stage II)
     transformer_model, trained_params = load_inference_model(config_obj, checkpoint_dir)
     
-    # Calculate sequence length (e.g., 64 for CIFAR-10)
-    seq_length = config_obj.image_size * config_obj.image_size // (4**2)
-    # Assuming 4x downsampling appaerently, thats what the AI said
-    # --- Setup Inputs ---
-    
-    # (B,) array with the class ID
-    # batch size is how many images we want
+    # 3. Load FSQ-VAE (Stage I)
+    try:
+        fsq_model = load_fsq_model(fsq_model_dir)
+    except Exception as e:
+        print(f"WARNING: Could not load FSQ model: {e}")
+        print("Will generate black images.")
+        fsq_model = None
+
+    # Setup Inputs
+    seq_length = config_obj.image_size * config_obj.image_size // (4**2) 
     class_labels = jnp.full((batch_size,), target_class_id, dtype=jnp.int32) 
-    
-    # Initial input: an array of all masked tokens (B, L)
-    # we get the ID of were predictions are to be made
-    # from 3.2 in MaskGit paper
-    # Initial input: an array of all masked tokens (B, L)
     mask_id = config_obj.transformer.mask_token_id
-    # Set intial tokens to the mask_ID, maskID is this a value that means that it hasnt been predicted yet
     initial_masked_tokens = jnp.full((batch_size, seq_length), mask_id, dtype=jnp.int32)
     
-    # --- Define the Logits Function (The heart of the inference loop) ---
+    # Define Logits Function
     def tokens_to_logits(token_ids):
-        """Feeds the current token state into the trained Transformer to get logits."""
-        # Ensure the class labels match the batch size of the token_ids
-        # This function runs inside the JIT-compiled decoding loop
-        # we input the current state of the sequence, we use all the existing tokens to predict the masked ones
-        logits = transformer_model.apply(
+        return transformer_model.apply(
             {'params': trained_params},
             input_ids=token_ids,
             class_labels=class_labels,
             deterministic=True
         )
-        # Logits are unnormalized prediction scores (raw numbers) for every possible token at every position in the input sequence.
-        # shape [B, L, K] K is codebook size
-        return logits
-    # JIT-compile the logits function to avoid recompilation on every decoder
-    # call. The first call will incur XLA compilation cost, but subsequent
-    # calls will reuse the compiled executable and be much faster.
-    tokens_to_logits_jit = jax.jit(tokens_to_logits)
-    # Warm-up / compile once on a representative input to avoid a compile
-    # happening inside the decoding loop (which can cause extra latency).
-    try:
-        print("Warming up transformer (one-time XLA compile)...")
-        _ = tokens_to_logits_jit(initial_masked_tokens)
-        print("Warmup complete.")
-    except Exception as e:
-        print(f"Warning: warmup compile failed: {e}")
-    # --- Run Parallel Decoding ---
-    
-    rng_key = jax.random.PRNGKey(42)
-    
-    print(f"\nStarting Scheduled Parallel Decoding for {num_steps} steps...")
-    print("--- JAX COMPILATION FOR DECODING WILL OCCUR NOW ---")
 
-    # Call the core decoding function
+    tokens_to_logits_jit = jax.jit(tokens_to_logits)
+
+    # Warm-up
+    print("Warming up transformer JIT...")
+    try: 
+        _ = tokens_to_logits_jit(initial_masked_tokens).block_until_ready()
+        print("Warmup complete.")
+    except Exception as e: 
+        print(f"Warmup warning: {e}")
+
+    # Run Parallel Decoding
+    print(f"\nStarting Scheduled Parallel Decoding for {num_steps} steps...")
+    rng_key = jax.random.PRNGKey(42)
+    t_start = time.time()
+    
     final_sequences = parallell_decode.decode(
         inputs=initial_masked_tokens,
         rng=rng_key,
@@ -419,67 +427,30 @@ def run_generation(
         mask_scheduling_method=config_obj.mask_scheduling_method
     )
 
-    print("Decoding complete.")
+    # CRITICAL: Force synchronization here
+    print("MaskGIT loop queued. Waiting for GPU to finish generation...")
+    final_sequences.block_until_ready()
+    print(f"MaskGIT Generation finished in {time.time() - t_start:.2f}s")
     
-    # --- Post-Processing and FSQ Decoding ---
-    
-    # Take the final output (from the last iteration)
+    # Take final output
     final_tokens = final_sequences[:, -1, :] 
     
-    # Convert final discrete tokens back into continuous image pixels
-    final_images = decode_tokens_to_image(final_tokens, fsq_decoder_module=None) 
+    # Decode to pixels
+    final_images = decode_tokens_to_image(final_tokens, fsq_decoder_module=fsq_model) 
     
-    # Save the results
+    # Save
     for i, img in enumerate(final_images):
         save_image(img, f"generated_image_class_{target_class_id}_sample_{i}.png")
     
-    print("Generation process finished.")
+    print("Done.")
 
 
 if __name__ == '__main__':
-    # ------------------ CODE GRAVEYARD: FAST TESTING CONFIG ------------------
-    # The tiny config used for fast testing is preserved here for debugging
-    # and reference. It is intentionally NOT applied so inference uses the
-    # real training configuration returned by `maskgit_class_cond_config.get_config()`.
-# TINY_CONFIG = ml_collections.ConfigDict({
-#         'image_size': 16,     # Smallest possible image size
-#         'num_class': 1000,    # Default number of classes (not changed)
-#         'transformer': {
-#             'mask_token_id': 257, # Visual codebook size + 1 (e.g., 256 + 1)
-#             'num_embeds': 4,      # Tiny hidden dimension (was 512/768)
-#             'num_layers': 1,      # Single layer Transformer (was 12/24)
-#             'num_heads': 1,       # Single attention head
-#             'intermediate_size': 8, # Tiny feed-forward size
-#             'dropout_rate': 0.0,
-#         },
-#         'sample_choice_temperature': 0.0,
-#         'mask_scheduling_method': 'cosine',
-#     })
-    
-#     # Override the config object function to return the tiny config for testing
-#     def get_tiny_config():
-#         return TINY_CONFIG
-    
-#     # Temporarily replace the real config getter with the tiny one
-#     config.get_config = get_tiny_config
-#     # ------------------ ADD END ------------------
-    
-#     # Example usage: Generate 4 images of class ID 5, using 16 refinement steps.
-#     # ... (rest of the run_generation call)
-#     run_generation(
-#         target_class_id=5, 
-#         batch_size=4, 
-#         num_steps=5, # Reduce steps for faster testing
-#         checkpoint_path='./your_best_maskgit_checkpoint'
-#     )
-    # ----------------------------------------------------------------
-
-    # Example usage: 
-    # checkpoint_dir is now explicitly set to the name of the folder containing the checkpoint.
+    # Adjust paths as necessary
     run_generation(
-        target_class_id=5, 
+        target_class_id=207, 
         batch_size=4, 
-        num_steps=5, # Keep steps low for fast testing
-        # FIX: Setting the checkpoint_dir to the folder name you specified.
-        checkpoint_dir='./maskgit_100' 
+        num_steps=12, 
+        checkpoint_dir='./maskgit_100',
+        fsq_model_dir='./models'
     )
