@@ -1,9 +1,17 @@
+import os
+
+# --- CRITICAL MEMORY SETTINGS (Must be before importing jax) ---
+# Prevent JAX from grabbing 90% of GPU memory at startup
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+# Use a more efficient memory allocator to prevent fragmentation errors
+os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
+# ---------------------------------------------------------------
+
 import jax
 import jax.numpy as jnp
 import ml_collections
 import numpy as np
 import optax
-import os
 import time
 
 # Flax utilities for loading the MaskGIT model
@@ -22,16 +30,16 @@ import maskgit_class_cond_config as config
 import maskgit_transformers as transformer
 import parallell_decode
 
-# --- CONSTANTS DERIVED FROM TRAINING SCRIPT ---
-CODEBOOK_SIZE = 512
+# --- CONSTANTS ---
+CODEBOOK_SIZE = 512 # 8 x 8 x 8 
 MASK_TOKEN_ID = 512 
-TRAINING_SEQ_LEN = 64
+TRAINING_SEQ_LEN = 64 # 8 x 8
 
 # ==============================================================================
-# ========================== 1. FSQ-VAE MODEL DEFINITIONS ======================
+# ========================== 1. FSQ-VAE MODEL CLASSES ==========================
 # ==============================================================================
 
-# Helper functions needed for FSQ-VAE
+# Helper functions needed for FSQ-VAE from Lukas' notebook
 def get_norm_layer(norm_type: Literal["BN", "LN", "GN"], num_features: int, rngs: nnx.Rngs) -> Callable[[jax.Array], jax.Array]:
     if norm_type == 'LN':
         return nnx.LayerNorm(num_features=num_features, rngs=rngs)
@@ -134,20 +142,41 @@ class FiniteScalarQuantizer(nnx.Module, Quantizer[None]):
         return z_q, None
     
     def decode_from_idx(self, ids: jax.Array) -> jax.Array:
-        """
-        Converts flat indices (0..CODEBOOK_SIZE-1) back to quantized vectors.
-        """
-        # 1. Unravel the flat index into multi-dimensional indices based on L
+        # Unravel the flat index into multi-dimensional indices based on L so 9 = (0,1,1) 
         coords = jnp.unravel_index(ids, self.L) # Tuple of arrays
         
         # Stack coordinates to shape [..., D]
         coords = jnp.stack(coords, axis=-1)
         
-        # 2. Shift coordinates to be centered around 0 (FSQ logic)
+        # Shift coordinates to be centered around 0 (FSQ logic)
         shifts = jnp.floor(self.L / 2)
         quantized_vectors = coords - shifts
         
         return quantized_vectors.astype(jnp.float32)
+    
+
+
+# FSQ Configuration
+class Config(TypedDict):
+    id: str
+    codebook_shape: list[int]
+    filters: int
+    num_res_blocks: int
+    channel_multipliers: list[int]
+    norm_type: str
+    quantizer_type: str
+    image_channels: int
+
+fsqvae_config = Config({
+    "id": "fsqvae_8x8x8", 
+    "codebook_shape": [8, 8, 8], 
+    "filters": 128,
+    "num_res_blocks": 2,
+    "channel_multipliers": [1, 2, 4],
+    "norm_type": "LN",
+    "quantizer_type": "fsq",
+    "image_channels": 3,
+})
 
 class Encoder(nnx.Module):
     def __init__(self, *args, **kwargs): pass
@@ -161,7 +190,7 @@ class VQVAE(nnx.Module, Generic[T]):
     def __init__(self, config: dict, quantizer: Quantizer[T], rngs: nnx.Rngs):
         embedding_dim = len(config['codebook_shape'])
         self.quantizer = quantizer
-        self.encoder = Encoder() # Dummy encoder
+        self.encoder = Encoder()
         self.decoder = Decoder(
             embedding_dim=embedding_dim,
             filters=config['filters'],
@@ -177,40 +206,68 @@ class VQVAE(nnx.Module, Generic[T]):
         reconstructed_image = self.decoder(z_vectors)
         return reconstructed_image
 
-# FSQ Configuration
-class Config(TypedDict):
-    id: str
-    codebook_shape: list[int]
-    filters: int
-    num_res_blocks: int
-    channel_multipliers: list[int]
-    norm_type: str
-    quantizer_type: str
-    image_channels: int
-
-fsqvae_config = Config({
-    "id": "fsqvae",
-    "codebook_shape": [8, 8, 8], # Produces 512 codes
-    "filters": 128,
-    "num_res_blocks": 2,
-    "channel_multipliers": [1, 2, 4],
-    "norm_type": "LN",
-    "quantizer_type": "fsq",
-    "image_channels": 3,
-})
-
-
 # ==============================================================================
 # ========================== 2. MODEL LOADING LOGIC ============================
 # ==============================================================================
 
-# --- STAGE II: TRANSFORMER MODEL LOADING ---
+# ----------------- COPY START: From loader.py -----------------
+
+def create_fsq_model(config: Config, rngs: nnx.Rngs) -> VQVAE[None]:
+    if config['quantizer_type'] == 'fsq':
+        if config['codebook_shape'] is None:
+            raise ValueError("codebook_shape must be specified for fsq quantizer.")
+        quantizer = FiniteScalarQuantizer(L = config['codebook_shape'])
+    else:
+        raise ValueError(f"Unknown quantizer type: {config['quantizer_type']}")
+        # this seems wrong    
+    model = VQVAE(config=config, quantizer=quantizer, rngs=rngs)
+    return model
+
+def create_ocp_manager(model_dir: str, config: Config) -> ocp.CheckpointManager:
+    # Ensure path is absolute to avoid PermissionError in WSL
+    model_dir = os.path.abspath(model_dir)
+    
+    options = ocp.CheckpointManagerOptions(
+        preservation_policy=ocp_pp.AnyPreservationPolicy([
+            ocp_pp.LatestN(2),
+            ocp_pp.EveryNSteps(10),
+        ]),
+         create=False) # create=False for inference
+    
+    manager = ocp.CheckpointManager(os.path.join(model_dir, "named", config["id"]), options=options)
+    return manager
+
+def load_model_checkpoint[T](model_dir: str, config: Config, create_model: Callable[[Config, nnx.Rngs], VQVAE[T]]) -> Optional[tuple[VQVAE[T], int]]:
+    with create_ocp_manager(model_dir, config) as manager:
+        # Create CONCRETE model (Fixes sharding error)
+        concrete_model = create_model(config, nnx.Rngs(0))
+        
+        # Split
+        graphdef, state = nnx.split(concrete_model)
+
+        step_to_restore = manager.latest_step()
+        if step_to_restore is not None:
+            print(f"Restoring FSQ from step {step_to_restore}...")
+            
+            # 3. Restore using PyTreeRestore
+            restored_state = manager.restore(step_to_restore,
+                args=ocp.args.PyTreeRestore(
+                    item=state,
+                    partial_restore=True,
+                ))
+            
+            start_step = step_to_restore + 1
+            return nnx.merge(graphdef, restored_state), start_step
+        else:
+            print(f"No FSQ checkpoint found in {manager.directory}")
+            return None
+
 def load_inference_model(config_obj, checkpoint_dir, step=None):
     """Loads the trained MaskGIT Transformer model parameters."""
     print(f"Loading MaskGIT Transformer model from directory: {checkpoint_dir}")
     
     model = transformer.Transformer(
-        vocab_size=CODEBOOK_SIZE + 1,
+        vocab_size=CODEBOOK_SIZE + 1, # +1 for mask token 
         num_classes=config_obj.num_class,
         hidden_size=config_obj.transformer.num_embeds,
         num_hidden_layers=config_obj.transformer.num_layers,
@@ -220,6 +277,7 @@ def load_inference_model(config_obj, checkpoint_dir, step=None):
     )
     
     rng_key = jax.random.PRNGKey(0)
+    # Reduced dummy size to save memory during init
     dummy_tokens = jnp.ones((1, TRAINING_SEQ_LEN), dtype=jnp.int32)
     dummy_labels = jnp.ones((1,), dtype=jnp.int32)
 
@@ -246,44 +304,13 @@ def load_inference_model(config_obj, checkpoint_dir, step=None):
 
     loaded_params = loaded_state.params
     print("MaskGIT Model loaded.")
+    
+    # Clean up initial params to free memory
+    del initial_state
+    jax.clear_caches()
+    
     return model, loaded_params
 
-# --- STAGE I: FSQ MODEL LOADING ---
-def load_fsq_model(model_dir: str):
-    """Loads the FSQ-VAE model using NNX and Orbax."""
-    print(f"Loading FSQ-VAE model from: {model_dir}")
-    
-    def create_model(cfg, rngs):
-        quantizer = FiniteScalarQuantizer(L=cfg['codebook_shape'])
-        return VQVAE(config=cfg, quantizer=quantizer, rngs=rngs)
-
-    # 1. Create Abstract Model
-    abstract_model = nnx.eval_shape(lambda: create_model(fsqvae_config, nnx.Rngs(0)))
-    graphdef, abstract_state = nnx.split(abstract_model)
-
-    # 2. Setup Orbax Manager
-    ckpt_path = os.path.join(model_dir, "named", fsqvae_config["id"])
-    if not os.path.exists(ckpt_path):
-        # Fallback to direct path
-        ckpt_path = model_dir
-    
-    print(f"Looking for FSQ checkpoints in: {ckpt_path}")
-    manager = ocp.CheckpointManager(ckpt_path)
-    step_to_restore = manager.latest_step()
-
-    if step_to_restore is None:
-        raise FileNotFoundError(f"No FSQ checkpoint found in {ckpt_path}")
-
-    # 3. Restore
-    print(f"Restoring FSQ at step {step_to_restore}...")
-    restored_state = manager.restore(step_to_restore, args=ocp.args.StandardRestore(abstract_state))
-    
-    # 4. Merge back into a runnable model
-    fsq_model = nnx.merge(graphdef, restored_state)
-    fsq_model.eval() 
-    print("FSQ-VAE Model loaded successfully.")
-    
-    return fsq_model
 
 # ==============================================================================
 # ========================== 3. INFERENCE LOGIC ================================
@@ -292,29 +319,21 @@ def load_fsq_model(model_dir: str):
 def decode_tokens_to_image(tokens, fsq_decoder_module):
     """
     Decodes discrete tokens [B, L] into images [B, H, W, 3] using the FSQ model.
-    Handles None decoder by returning black images.
-    Blocks until GPU is done to avoid hanging later.
     """
     t0 = time.time()
-    
-    # Reshape tokens: [B, 64] -> [B, 8, 8] assuming 8x8 latent grid
     b, l = tokens.shape
     h = w = int(np.sqrt(l)) 
     latent_indices = tokens.reshape(b, h, w)
     
     print(f"Tokens prepared for FSQ. Shape: {latent_indices.shape}")
 
-    # --- CASE 1: No FSQ Model ---
     if fsq_decoder_module is None:
-        print("No FSQ decoder provided. Generating placeholder (black) images...")
+        print("No FSQ decoder provided. Generating black images...")
         # Assume 16x upsampling (8x8 -> 128x128)
         images = jnp.zeros((b, h * 16, w * 16, 3), dtype=jnp.float32)
-        # CRITICAL: Wait for this array to exist
         images.block_until_ready()
-        print(f"Placeholder generation took {time.time() - t0:.3f}s")
         return images
-
-    # --- CASE 2: FSQ Model Present ---
+    # main case
     try:
         @nnx.jit
         def _decode(model, idxs):
@@ -324,11 +343,8 @@ def decode_tokens_to_image(tokens, fsq_decoder_module):
         images = _decode(fsq_decoder_module, latent_indices)
         
         print("Waiting for GPU to finish FSQ decoding...")
-        # CRITICAL: Wait for computation
         images.block_until_ready()
         
-        print(f"Output Image Shape: {images.shape}")
-
         # Normalize [-1, 1] -> [0, 1]
         images = (images + 1.0) / 2.0
         images = jnp.clip(images, 0.0, 1.0)
@@ -340,16 +356,13 @@ def decode_tokens_to_image(tokens, fsq_decoder_module):
         print(f"FSQ Error: {e}")
         import traceback
         traceback.print_exc()
-        # Fallback to black image
         fallback = jnp.zeros((b, h * 16, w * 16, 3), dtype=jnp.float32)
         fallback.block_until_ready()
         return fallback
 
 def save_image(image, filename):
     print(f"Saving {filename}...")
-    # Convert to numpy (this will be fast because we blocked previously)
     arr = np.array(image)
-    
     if arr.dtype == np.float32 or arr.dtype == np.float64:
         arr = np.clip(arr, 0.0, 1.0)
         arr = (arr * 255).astype(np.uint8)
@@ -365,7 +378,7 @@ def save_image(image, filename):
 
 def run_generation(
     target_class_id: int, 
-    batch_size: int = 4, 
+    batch_size: int = 1,  # CHANGED: Default to 1 to avoid OOM
     num_steps: int = 12, 
     checkpoint_dir: str = './checkpoints4',
     fsq_model_dir: str = './models'
@@ -379,12 +392,17 @@ def run_generation(
     transformer_model, trained_params = load_inference_model(config_obj, checkpoint_dir)
     
     # 3. Load FSQ-VAE (Stage I)
-    try:
-        fsq_model = load_fsq_model(fsq_model_dir)
-    except Exception as e:
-        print(f"WARNING: Could not load FSQ model: {e}")
+    print("--- Loading FSQ Model ---")
+    fsq_result = load_model_checkpoint(fsq_model_dir, fsqvae_config, create_fsq_model)
+    
+    if fsq_result is None:
+        print(f"WARNING: Could not load FSQ model: {fsq_model_dir}")
         print("Will generate black images.")
         fsq_model = None
+    else:
+        fsq_model, step = fsq_result
+        fsq_model.eval() # Set to eval mode
+        print(f"FSQ Model loaded successfully from step {step-1}")
 
     # Setup Inputs
     seq_length = config_obj.image_size * config_obj.image_size // (4**2) 
@@ -403,13 +421,14 @@ def run_generation(
 
     tokens_to_logits_jit = jax.jit(tokens_to_logits)
 
-    # Warm-up
+    # Warm-up (Can fail on low memory GPUs, try/catch ensures we continue)
+    # lmao I dont know why we are warming up, AI just added it lol
     print("Warming up transformer JIT...")
     try: 
         _ = tokens_to_logits_jit(initial_masked_tokens).block_until_ready()
         print("Warmup complete.")
     except Exception as e: 
-        print(f"Warmup warning: {e}")
+        print(f"Warmup skipped/failed (Non-fatal if OOM): {e}")
 
     # Run Parallel Decoding
     print(f"\nStarting Scheduled Parallel Decoding for {num_steps} steps...")
@@ -427,7 +446,6 @@ def run_generation(
         mask_scheduling_method=config_obj.mask_scheduling_method
     )
 
-    # CRITICAL: Force synchronization here
     print("MaskGIT loop queued. Waiting for GPU to finish generation...")
     final_sequences.block_until_ready()
     print(f"MaskGIT Generation finished in {time.time() - t_start:.2f}s")
@@ -449,8 +467,8 @@ if __name__ == '__main__':
     # Adjust paths as necessary
     run_generation(
         target_class_id=207, 
-        batch_size=4, 
+        batch_size=1, # only works with 1 for me
         num_steps=12, 
-        checkpoint_dir='./maskgit_100',
-        fsq_model_dir='./models'
+        checkpoint_dir=os.path.abspath('./maskgit_100'),
+        fsq_model_dir= os.path.abspath('./models')
     )
